@@ -1,4 +1,4 @@
-package com.agent.demo.util;
+package com.agent.demo.exception;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.converter.HttpMessageNotReadableException;

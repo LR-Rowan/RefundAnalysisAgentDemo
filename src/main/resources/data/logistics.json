@@ -1,0 +1,13 @@
+{
+  "storeId": "S001",
+  "windowDays": 7,
+  "delayedRate": 0.18,
+  "topCarriers": [
+    {"carrier":"SF","delayedRate":0.12},
+    {"carrier":"YTO","delayedRate":0.25}
+  ],
+  "topCities": [
+    {"city":"Beijing","delayedRate":0.22},
+    {"city":"Shanghai","delayedRate":0.15}
+  ]
+}
