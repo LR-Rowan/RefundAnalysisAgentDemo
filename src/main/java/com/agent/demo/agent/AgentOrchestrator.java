@@ -10,15 +10,18 @@ import com.agent.demo.llm.OpenAIClient;
 import com.agent.demo.llm.OpenAISseParser;
 import com.agent.demo.tools.ToolRegistry;
 import com.agent.demo.tools.ToolResult;
+import com.agent.demo.trace.IdGenerators;
+import com.agent.demo.trace.TraceKeys;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.util.context.ContextView;
 
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.UUID;
+import java.util.Objects;
 
 /**
  * Agent - 编排器
@@ -42,8 +45,11 @@ public class AgentOrchestrator {
         this.resultStore = resultStore;
     }
 
-    public Flux<AgentEvent> run(AgentContext ctx) {
-        String resultId = UUID.randomUUID().toString().replace("-", "");
+    public Flux<AgentEvent> run(AgentContext ctx, String incomingTraceId) {
+        final String resultId = IdGenerators.newResultId();
+        // traceId: 优先用上游传入（HTTP Header），否则生成
+        final String traceId =(Objects.nonNull(incomingTraceId) && !incomingTraceId.isBlank())
+                ? incomingTraceId : IdGenerators.newTraceId();
 
         Flux<AgentEvent> start = Flux.just(AgentEvent.status("planning"));
 
@@ -152,6 +158,7 @@ public class AgentOrchestrator {
                             }
 
                             String meta = "{\"resultId\":\"" + resultId
+                                    + "\",\"traceId\":\"" + escapeJson(traceId)
                                     + "\",\"downloadUrl\":\"/agent/results/" + resultId
                                     + "\",\"savedPath\":\"" + escapeJson(savedPath) + "\"}";
 
@@ -163,7 +170,13 @@ public class AgentOrchestrator {
 
         Flux<AgentEvent> end = Flux.just(AgentEvent.status("done"));
 
-        return Flux.concat(start, planEvent, toolsFlow, summarizingStart, summarizingFlow, resultStart, resultFlow, end);
+        return Flux.concat(start, planEvent, toolsFlow, summarizingStart, summarizingFlow, resultStart, resultFlow, end)
+                // 统一 stamp：保证每个 AgentEvent 都带 rid/tid（包括 fallback/timeout/工具异常产生的事件）
+                //
+                // stampTrace 在下游会读不到 contextWrite 写入的 key，产生报错: "Missing reactor context key: resultId"
+                .transform(this::stampTrace)
+                // 全链路挂上 traceId/resultId（Planner/Tools/Summarizer/Result/End 全覆盖）
+                .contextWrite(c -> c.put(TraceKeys.RESULT_ID, resultId).put(TraceKeys.TRACE_ID, traceId));
     }
 
     private AgentEvent toToolEvent(ToolResult r) {
@@ -208,5 +221,22 @@ public class AgentOrchestrator {
     private static String escapeJson(String s) {
         if (s == null) return "";
         return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    private Flux<AgentEvent> stampTrace(Flux<AgentEvent> upstream) {
+        return Flux.deferContextual(ctx -> {
+            String rid = getRequired(ctx, TraceKeys.RESULT_ID);
+            String tid = getRequired(ctx, TraceKeys.TRACE_ID);
+            return upstream.map(ev -> ev.withTrace(rid, tid));
+        });
+    }
+
+    private static String getRequired(ContextView ctx, String key) {
+        Object v = ctx.getOrDefault(key, null);
+        if (v == null) {
+            // 生产级：不要 silent fail，否则 trace 丢了难排查
+            throw new IllegalStateException("Missing reactor context key: " + key);
+        }
+        return String.valueOf(v);
     }
 }
