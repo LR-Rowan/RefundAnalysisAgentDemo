@@ -3,6 +3,7 @@ package com.agent.demo.agent;
 import com.agent.demo.agent.plan.Plan;
 import com.agent.demo.agent.plan.Planner;
 import com.agent.demo.agent.plan.ToolCall;
+import com.agent.demo.agent.result.ResultGenerator;
 import com.agent.demo.llm.OpenAIClient;
 import com.agent.demo.llm.OpenAISseParser;
 import com.agent.demo.tools.ToolRegistry;
@@ -24,11 +25,13 @@ public class AgentOrchestrator {
     private final Planner planner;
     private final ToolRegistry toolRegistry;
     private final OpenAIClient openAIClient;
+    private final ResultGenerator resultGenerator;
 
-    public AgentOrchestrator(Planner planner, ToolRegistry toolRegistry, OpenAIClient openAIClient) {
+    public AgentOrchestrator(Planner planner, ToolRegistry toolRegistry, OpenAIClient openAIClient, ResultGenerator resultGenerator) {
         this.planner = planner;
         this.toolRegistry = toolRegistry;
         this.openAIClient = openAIClient;
+        this.resultGenerator = resultGenerator;
     }
 
     public Flux<AgentEvent> run(AgentContext ctx) {
@@ -117,9 +120,23 @@ public class AgentOrchestrator {
                             return Flux.just(AgentEvent.delta(sb.toString()));
                         });
 
+        Flux<AgentEvent> resultFlow =
+                resultGenerator.generate(ctx, collected)
+                        .map(r -> {
+                            try {
+                                String json = MAPPER.writeValueAsString(r);
+                                return AgentEvent.result(json);
+                            } catch (Exception e) {
+                                return AgentEvent.result("{\"error\":\"result_serialize_failed\"}");
+                            }
+                        })
+                        .onErrorResume(ex -> Mono.just(AgentEvent.result("{\"error\":\"result_generation_failed\",\"message\":\"" + escapeJson(ex.getMessage()) + "\"}")))
+                        .flux();
+
+
         Flux<AgentEvent> end = Flux.just(AgentEvent.status("done"));
 
-        return Flux.concat(start, planEvent, toolsFlow, summarizingStart, summarizingFlow, end);
+        return Flux.concat(start, planEvent, toolsFlow, summarizingStart, summarizingFlow, resultFlow, end);
     }
 
     private AgentEvent toToolEvent(ToolResult r) {
