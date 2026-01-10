@@ -3,52 +3,66 @@ package com.agent.demo.llm;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-/**
- * Responses API 的返回 JSON 里，真正文本通常不在根节点，你不能直接用 bodyToMono(String.class) 当作最终 plan 文本。
- * 所以我们还要加一个解析函数：从 response JSON 中提取 output_text
- */
 public class ResponsesTextExtractor {
+
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /**
-     * 从 /v1/responses 的非流式返回中提取输出文本（尽量稳健）。
-     */
     public static String extractOutputText(String responseJson) {
+        if (responseJson == null || responseJson.isBlank()) return "";
+
         try {
             JsonNode root = MAPPER.readTree(responseJson);
 
-            // 常见：root.output_text（如果存在就直接用）
-            JsonNode outputText = root.path("output_text");
-            if (outputText.isTextual() && !outputText.asText().isBlank()) {
-                return outputText.asText();
+            // 1) 有些场景会直接有 output_text 字段
+            JsonNode direct = root.path("output_text");
+            if (direct.isTextual() && !direct.asText().isBlank()) {
+                return direct.asText();
             }
 
-            // 兜底：root.response.output_text（你流式事件里有 response 字段）
+            // 2) 兼容 root.response.*
             JsonNode resp = root.path("response");
-            JsonNode respOutputText = resp.path("output_text");
-            if (respOutputText.isTextual() && !respOutputText.asText().isBlank()) {
-                return respOutputText.asText();
+            JsonNode respDirect = resp.path("output_text");
+            if (respDirect.isTextual() && !respDirect.asText().isBlank()) {
+                return respDirect.asText();
             }
 
-            // 再兜底：遍历 output 数组，拼 content.text（不同模型/版本可能差异）
-            JsonNode output = resp.path("output");
+            // 3) ✅ 关键：遍历 output[].content[] 找 type=output_text 的 text
+            JsonNode output = root.path("output");
             if (output.isArray()) {
-                StringBuilder sb = new StringBuilder();
                 for (JsonNode item : output) {
                     JsonNode content = item.path("content");
                     if (content.isArray()) {
                         for (JsonNode c : content) {
-                            JsonNode text = c.path("text");
-                            if (text.isTextual()) sb.append(text.asText());
+                            String type = c.path("type").asText("");
+                            if ("output_text".equals(type)) {
+                                String text = c.path("text").asText("");
+                                if (!text.isBlank()) return text;
+                            }
                         }
                     }
                 }
-                String t = sb.toString();
-                if (!t.isBlank()) return t;
             }
 
-            // 实在提取不到，返回原始 JSON 以便定位
+            // 4) 再兜底：如果 output 在 root.response.output
+            JsonNode respOutput = resp.path("output");
+            if (respOutput.isArray()) {
+                for (JsonNode item : respOutput) {
+                    JsonNode content = item.path("content");
+                    if (content.isArray()) {
+                        for (JsonNode c : content) {
+                            String type = c.path("type").asText("");
+                            if ("output_text".equals(type)) {
+                                String text = c.path("text").asText("");
+                                if (!text.isBlank()) return text;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 最后兜底：返回原文便于定位
             return responseJson;
+
         } catch (Exception e) {
             return responseJson;
         }
