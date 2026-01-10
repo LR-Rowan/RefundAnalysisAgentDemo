@@ -65,4 +65,29 @@ public class OpenAIClient {
                 )
                 .bodyToFlux(String.class);      // 一行一行读SSE，不是等结束
     }
+
+    /**
+     * 非流式一次性调用, 用于Planner
+     *
+     * @param prompt String
+     * @return Mono<String>
+     */
+    public Mono<String> callOnce(String prompt) {
+        Map<String, Object> body = Map.of(
+                "model", model,
+                "input", prompt,
+                "stream", false
+        );
+
+        return webClient.post()
+                .uri("/v1/responses")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(body)
+                .retrieve()
+                .onStatus(s -> s.isError(), resp ->
+                        resp.bodyToMono(String.class).flatMap(msg ->
+                                Mono.error(new RuntimeException("OpenAI HTTP " + resp.statusCode() + " body=" + msg))
+                        ))
+                .bodyToMono(String.class);
+    }
 }
