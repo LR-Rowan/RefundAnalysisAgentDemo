@@ -1,6 +1,7 @@
 package com.agent.demo.agent;
 
 public record AgentEvent(String type, String payload) {
+
     public static AgentEvent status(String s) {
         return new AgentEvent("status", s);
     }
@@ -15,5 +16,9 @@ public record AgentEvent(String type, String payload) {
 
     public static AgentEvent result(String s) {
         return new AgentEvent("result", s);
+    }
+
+    public static AgentEvent resultMeta(String s) {
+        return new AgentEvent("resultMeta", s);
     }
 }

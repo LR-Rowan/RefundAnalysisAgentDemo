@@ -3,7 +3,9 @@ package com.agent.demo.agent;
 import com.agent.demo.agent.plan.Plan;
 import com.agent.demo.agent.plan.Planner;
 import com.agent.demo.agent.plan.ToolCall;
+import com.agent.demo.agent.result.ResultFallBackBuilder;
 import com.agent.demo.agent.result.ResultGenerator;
+import com.agent.demo.agent.result.ResultStore;
 import com.agent.demo.llm.OpenAIClient;
 import com.agent.demo.llm.OpenAISseParser;
 import com.agent.demo.tools.ToolRegistry;
@@ -16,7 +18,11 @@ import reactor.core.publisher.Mono;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
+/**
+ * Agent - 编排器
+ */
 @Service
 public class AgentOrchestrator {
 
@@ -26,15 +32,19 @@ public class AgentOrchestrator {
     private final ToolRegistry toolRegistry;
     private final OpenAIClient openAIClient;
     private final ResultGenerator resultGenerator;
+    private final ResultStore resultStore;
 
-    public AgentOrchestrator(Planner planner, ToolRegistry toolRegistry, OpenAIClient openAIClient, ResultGenerator resultGenerator) {
+    public AgentOrchestrator(Planner planner, ToolRegistry toolRegistry, OpenAIClient openAIClient, ResultGenerator resultGenerator, ResultStore resultStore) {
         this.planner = planner;
         this.toolRegistry = toolRegistry;
         this.openAIClient = openAIClient;
         this.resultGenerator = resultGenerator;
+        this.resultStore = resultStore;
     }
 
     public Flux<AgentEvent> run(AgentContext ctx) {
+        String resultId = UUID.randomUUID().toString().replace("-", "");
+
         Flux<AgentEvent> start = Flux.just(AgentEvent.status("planning"));
 
         Mono<Plan> planMono = planner.plan(ctx)
@@ -120,23 +130,40 @@ public class AgentOrchestrator {
                             return Flux.just(AgentEvent.delta(sb.toString()));
                         });
 
+        Flux<AgentEvent> resultStart = Flux.just(AgentEvent.status("result_generating"));
+
         Flux<AgentEvent> resultFlow =
                 resultGenerator.generate(ctx, collected)
-                        .map(r -> {
-                            try {
-                                String json = MAPPER.writeValueAsString(r);
-                                return AgentEvent.result(json);
-                            } catch (Exception e) {
-                                return AgentEvent.result("{\"error\":\"result_serialize_failed\"}");
-                            }
+                        .timeout(Duration.ofSeconds(60))
+                        .onErrorResume(ex -> {
+                            // 超时/失败 -> 本地兜底结构化结果
+                            return Mono.just(ResultFallBackBuilder.build(ctx, collected));
                         })
-                        .onErrorResume(ex -> Mono.just(AgentEvent.result("{\"error\":\"result_generation_failed\",\"message\":\"" + escapeJson(ex.getMessage()) + "\"}")))
-                        .flux();
+                        .flatMapMany(r -> {
+                            // 1) 落盘
+                            String savedPath = resultStore.save(resultId, r);
 
+                            // 2) 输出 result + meta
+                            String json;
+                            try {
+                                json = MAPPER.writeValueAsString(r);
+                            } catch (Exception e) {
+                                json = "{\"error\":\"result_serialize_failed\"}";
+                            }
+
+                            String meta = "{\"resultId\":\"" + resultId
+                                    + "\",\"downloadUrl\":\"/agent/results/" + resultId
+                                    + "\",\"savedPath\":\"" + escapeJson(savedPath) + "\"}";
+
+                            return Flux.just(
+                                    AgentEvent.result(json),
+                                    AgentEvent.resultMeta(meta)
+                            );
+                        });
 
         Flux<AgentEvent> end = Flux.just(AgentEvent.status("done"));
 
-        return Flux.concat(start, planEvent, toolsFlow, summarizingStart, summarizingFlow, resultFlow, end);
+        return Flux.concat(start, planEvent, toolsFlow, summarizingStart, summarizingFlow, resultStart, resultFlow, end);
     }
 
     private AgentEvent toToolEvent(ToolResult r) {
@@ -151,21 +178,21 @@ public class AgentOrchestrator {
         String toolsJson = MAPPER.writeValueAsString(results);
 
         return """
-        你是电商运营分析助手，请基于工具结果给出结论。
-        
-        输出要求：
-        1) 指标摘要（3条以内）
-        2) 主要原因（按影响排序，3条）
-        3) 可执行建议（3条，尽量具体）
-        
-        输入：
-        storeId=%s
-        query=%s
-        windowDays=%d
-        
-        工具结果（JSON）：
-        %s
-        """.formatted(ctx.storeId(), ctx.query(), ctx.windowDays(), toolsJson);
+                你是电商运营分析助手，请基于工具结果给出结论。
+                
+                输出要求：
+                1) 指标摘要（3条以内）
+                2) 主要原因（按影响排序，3条）
+                3) 可执行建议（3条，尽量具体）
+                
+                输入：
+                storeId=%s
+                query=%s
+                windowDays=%d
+                
+                工具结果（JSON）：
+                %s
+                """.formatted(ctx.storeId(), ctx.query(), ctx.windowDays(), toolsJson);
     }
 
     private static int parseInt(Object x, int fallback) {

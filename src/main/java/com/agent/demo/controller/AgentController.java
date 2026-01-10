@@ -2,17 +2,17 @@ package com.agent.demo.controller;
 
 import com.agent.demo.agent.AgentContext;
 import com.agent.demo.agent.AgentOrchestrator;
+import com.agent.demo.agent.result.ResultStore;
 import com.agent.demo.dto.RunRequest;
 import com.agent.demo.llm.OpenAIClient;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.http.codec.ServerSentEvent;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * SSE Controller
@@ -26,10 +26,10 @@ import reactor.core.publisher.Flux;
 public class AgentController {
 
     @Autowired
-    private OpenAIClient openAIClient;
+    private AgentOrchestrator agentOrchestrator;
 
     @Autowired
-    private AgentOrchestrator agentOrchestrator;
+    private ResultStore resultStore;
 
     /**
      * produces = TEXT_EVENT_STREAM: 告诉Spring返回的是SSE, 浏览器会一条条接收, 避免Flux一次性聚合
@@ -39,7 +39,6 @@ public class AgentController {
             produces = MediaType.TEXT_EVENT_STREAM_VALUE
     )
     public Flux<ServerSentEvent<String>> run(@Valid @RequestBody RunRequest request) {
-
         AgentContext ctx = new AgentContext(request.storeId(), request.query(), 7);
 
         return agentOrchestrator.run(ctx)
@@ -47,5 +46,26 @@ public class AgentController {
                         .event(evt.type())
                         .data(evt.payload())
                         .build());
+    }
+
+    /**
+     * 下载接口, 浏览器/curl 直接能拿到 JSON
+     * <p>
+     *
+     * @param resultId String
+     * @return Mono<ResponseEntity<String>>
+     */
+    @GetMapping(value = "/results/{resultId}", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<ResponseEntity<String>> downloadResult(@PathVariable("resultId") String resultId) {
+        return Mono.fromCallable(() -> resultStore.loadRaw(resultId))
+                .map(body -> ResponseEntity.ok()
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .body(body)
+                )
+                .onErrorResume(ex -> Mono.just(
+                        ResponseEntity.status(404)
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .body("{\"error\":\"not_found\",\"message\":\"" + ex.getMessage().replace("\"", "\\\"") + "\"}")
+                ));
     }
 }
