@@ -32,7 +32,7 @@ public class AgentOrchestrator {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final Duration TOOL_TIMEOUT = Duration.ofSeconds(5);
     private static final Duration LLM_TIMEOUT  = Duration.ofSeconds(30);
-    private static final Duration RUN_TIMEOUT  = Duration.ofSeconds(90);
+    private static final Duration RUN_TIMEOUT  = Duration.ofSeconds(300);
 
     private final Planner planner;
     private final ToolRegistry toolRegistry;

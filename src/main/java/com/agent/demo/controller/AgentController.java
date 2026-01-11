@@ -5,17 +5,21 @@ import com.agent.demo.agent.AgentEvent;
 import com.agent.demo.agent.AgentOrchestrator;
 import com.agent.demo.agent.result.ResultStore;
 import com.agent.demo.dto.RunRequest;
+import com.agent.demo.infra.ConcurrencyLimiter;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.time.Duration;
 import java.util.Objects;
 
 /**
@@ -55,6 +59,9 @@ public class AgentController {
     @Autowired
     private ResultStore resultStore;
 
+    @Autowired
+    private ConcurrencyLimiter limiter;
+
     /**
      * produces = TEXT_EVENT_STREAM: 告诉Spring返回的是SSE, 浏览器会一条条接收, 避免Flux一次性聚合
      */
@@ -65,65 +72,82 @@ public class AgentController {
     public Flux<ServerSentEvent<String>> run(
             @RequestHeader(value = "X-Trace-Id", required = false) String traceId,
             @RequestParam(value = "legacy", required = false, defaultValue = "false") boolean legacy,
+            @RequestParam(value = "debugHoldMs", required = false, defaultValue = "0") long debugHoldMs,
             @Valid @RequestBody RunRequest request) {
+
         int windowDays = Objects.isNull(request.windowDays()) ? WINDOW_DAYS : request.windowDays();
         AgentContext ctx = new AgentContext(request.storeId(), request.query(), windowDays);
 
-        // 用 defer 确保 startMillis 每次订阅（每次请求）独立，不串
+        // 用 defer 确保：只有真正订阅时才占用 permit
         return Flux.defer(() -> {
+            ConcurrencyLimiter.Permit permit = limiter.tryAcquire(ctx.storeId());
+            if (!permit.acquired()) {
+                return Flux.error(new ResponseStatusException(
+                        HttpStatus.TOO_MANY_REQUESTS,
+                        "rate_limited:" + permit.denyReason()
+                ));
+            }
+
             final long startMillis = System.currentTimeMillis();
             Flux<AgentEvent> source = agentOrchestrator.run(ctx, traceId);
+
+            Flux<ServerSentEvent<String>> out;
             if (legacy) {
-                // 旧协议：完全不包 envelope
-                return source.map(evt -> ServerSentEvent.<String>builder()
+                out = source.map(evt -> ServerSentEvent.<String>builder()
                         .event(evt.type())
                         .data(evt.payload())
                         .build());
+            } else {
+                out = source
+                        .index()
+                        .map(tuple -> {
+                            long seq = tuple.getT1();
+                            AgentEvent evt = tuple.getT2();
+                            long ts = System.currentTimeMillis();
+                            long durationMs = ts - startMillis;
+
+                            Object payloadObj = tryParseJson(evt.payload());
+                            String stage = inferStage(evt, payloadObj);
+
+                            SseEnvelope env = new SseEnvelope(
+                                    evt.resultId(),
+                                    evt.traceId(),
+                                    seq,
+                                    ts,
+                                    durationMs,
+                                    stage,
+                                    payloadObj
+                            );
+
+                            String data;
+                            try {
+                                data = mapper.writeValueAsString(env);
+                            } catch (Exception e) {
+                                data = "{\"resultId\":\"" + safe(evt.resultId()) +
+                                        "\",\"traceId\":\"" + safe(evt.traceId()) +
+                                        "\",\"seq\":" + seq +
+                                        ",\"ts\":" + ts +
+                                        ",\"durationMs\":" + durationMs +
+                                        ",\"stage\":\"error\"" +
+                                        ",\"data\":\"json_serialize_failed\"}";
+                            }
+
+                            return ServerSentEvent.<String>builder()
+                                    .event(evt.type())
+                                    .data(data)
+                                    .build();
+                        });
+            }
+            // Debug hold：用于压测/验收并发隔离，让连接占用更稳定（非阻塞）
+            // debugHoldMs=0 默认不生效
+            if (debugHoldMs > 0) {
+                out = out.concatWith(reactor.core.publisher.Mono.delay(Duration.ofMillis(debugHoldMs)).flatMapMany(x -> Flux.empty()));
             }
 
-            // 新协议：带观测字段 + envelope
-            return source
-                    .index() // 给每个事件一个 seq（0..n）
-                    .map(tuple -> {
-                        long seq = tuple.getT1();
-                        AgentEvent evt = tuple.getT2();
-                        long ts = System.currentTimeMillis();
-                        long durationMs = ts - startMillis;
-
-                        Object payloadObj = tryParseJson(evt.payload());
-                        String stage = inferStage(evt, payloadObj);
-
-                        SseEnvelope env = new SseEnvelope(
-                                evt.resultId(),
-                                evt.traceId(),
-                                seq,
-                                ts,
-                                durationMs,
-                                stage,
-                                payloadObj
-                        );
-
-                        String data;
-                        try {
-                            data = mapper.writeValueAsString(env);
-                        } catch (Exception e) {
-                            // 生产级容错：序列化失败不能打断 SSE stream
-                            data = "{\"resultId\":\"" + safe(evt.resultId()) +
-                                    "\",\"traceId\":\"" + safe(evt.traceId()) +
-                                    "\",\"seq\":" + seq +
-                                    ",\"ts\":" + ts +
-                                    ",\"durationMs\":" + durationMs +
-                                    ",\"stage\":\"error\"" +
-                                    ",\"data\":\"json_serialize_failed\"}";
-                        }
-
-                        return ServerSentEvent.<String>builder()
-                                .event(evt.type()) // event 名仍然保持：status/tool/delta/result/resultMeta...
-                                .data(data)
-                                .build();
-                    });
+            return out.doFinally(sig -> permit.release());
         });
     }
+
 
     /**
      * 下载接口, 浏览器/curl 直接能拿到 JSON

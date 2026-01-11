@@ -6,3 +6,10 @@ openai:
 logging:
   level:
     reactor.netty.channel.FluxReceive: ERROR
+
+agent:
+  limits:
+    globalMaxConcurrent: 10
+    perStoreMaxConcurrent: 2
+    storeIdleTtlMinutes: 30
+    maxStores: 10000
