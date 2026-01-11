@@ -169,6 +169,9 @@ public class AgentOrchestrator {
         Flux<AgentEvent> end = Flux.just(AgentEvent.status("done"));
 
         return Flux.concat(start, planEvent, toolsFlow, summarizingStart, summarizingFlow, resultStart, resultFlow, end)
+                // cancel 观测点 + 确保取消信号能触发
+                .doOnCancel(() -> System.out.println("[CANCEL] client disconnected"))
+                .doFinally(signal -> System.out.println("[FINALLY] signal=" + signal))
                 // 统一 stamp：保证每个 AgentEvent 都带 rid/tid（包括 fallback/timeout/工具异常产生的事件）
                 //
                 // stampTrace 在下游会读不到 contextWrite 写入的 key，产生报错: "Missing reactor context key: resultId"
