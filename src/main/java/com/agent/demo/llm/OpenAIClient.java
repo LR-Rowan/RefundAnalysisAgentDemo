@@ -57,13 +57,20 @@ public class OpenAIClient {
                 .contentType(MediaType.APPLICATION_JSON)
                 .accept(MediaType.TEXT_EVENT_STREAM)        // 告诉OpenAI要流式
                 .bodyValue(body)
-                .retrieve()
-                .onStatus(s -> s.isError(), resp ->
-                        resp.bodyToMono(String.class).flatMap(msg ->
-                                Mono.error(new RuntimeException("OpenAI HTTP " + resp.statusCode() + " body=" + msg))
-                        )
-                )
-                .bodyToFlux(String.class);      // 一行一行读SSE，不是等结束
+                .exchangeToFlux(resp -> {
+                    if (resp.statusCode().isError()) {
+                        return resp.bodyToMono(String.class)
+                                .defaultIfEmpty("")
+                                .flatMapMany(msg -> Flux.error(
+                                        new RuntimeException("OpenAI HTTP " + resp.statusCode() + " body=" + msg)
+                                ));
+                    }
+                    // 直接流式读取响应体；下游 cancel 会取消订阅并关闭连接
+                    return resp.bodyToFlux(String.class);
+                })
+                // 取消可观测（证明 Ctrl+C 能停掉上游）
+                .doOnCancel(() -> System.out.println("[OPENAI] stream cancelled by downstream"))
+                .doFinally(sig -> System.out.println("[OPENAI] stream finished signal=" + sig));
     }
 
     /**
