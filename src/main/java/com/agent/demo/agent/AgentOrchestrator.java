@@ -3,6 +3,7 @@ package com.agent.demo.agent;
 import com.agent.demo.agent.plan.Plan;
 import com.agent.demo.agent.plan.Planner;
 import com.agent.demo.agent.plan.ToolCall;
+import com.agent.demo.agent.result.AgentResult;
 import com.agent.demo.agent.result.ResultFallBackBuilder;
 import com.agent.demo.agent.result.ResultGenerator;
 import com.agent.demo.agent.result.ResultStore;
@@ -309,35 +310,54 @@ public class AgentOrchestrator {
 
     // ------------------------- result -------------------------
     private Flux<AgentEvent> buildResultFlow(AgentContext ctx, List<ToolResult> collected, String resultId) {
-        // result generator 的 timeout 也打点（可选）
+        final long start = System.currentTimeMillis();
+
         return resultGenerator.generate(ctx, collected)
                 .timeout(RESULT_TIMEOUT)
+                .map(r -> new ResultBox(r, "ok", null))
                 .onErrorResume(TimeoutException.class, ex -> {
                     metrics.timeout("result");
-                    return Mono.just(ResultFallBackBuilder.build(ctx, collected));
+                    return Mono.just(new ResultBox(
+                            ResultFallBackBuilder.build(ctx, collected),
+                            "timeout_fallback", ex));
                 })
-                .onErrorResume(ex -> Mono.just(ResultFallBackBuilder.build(ctx, collected)))
-                .flatMapMany(r -> {
-                    String savedPath = resultStore.save(resultId, r);
+                .onErrorResume(ex -> Mono.just(new ResultBox(
+                        ResultFallBackBuilder.build(ctx, collected),
+                        "error_fallback", ex)))
+                .flatMapMany(box -> {
+                    // 1) 落盘（保证可下载）
+                    String savedPath = resultStore.save(resultId, box.result());
+
+                    // 2) outcome 日志（准生产排障关键）
+                    long costMs = System.currentTimeMillis() - start;
+                    if (box.error() != null) {
+                        LOGGER.warn("result_done outcome={} costMs={} err={}", box.outcome(), costMs, box.error().toString());
+                    } else {
+                        LOGGER.info("result_done outcome={} costMs={}", box.outcome(), costMs);
+                    }
                     LOGGER.info("result_saved path={} downloadUrl=/agent/results/{}", savedPath, resultId);
 
+                    // 3) result + meta
                     String json;
                     try {
-                        json = MAPPER.writeValueAsString(r);
+                        json = MAPPER.writeValueAsString(box.result());
                     } catch (Exception e) {
                         json = "{\"error\":\"result_serialize_failed\"}";
                     }
-
                     String meta = "{\"downloadUrl\":\"/agent/results/" + resultId
-                            + "\",\"savedPath\":\"" + escapeJson(savedPath) + "\"}";
+                            + "\",\"savedPath\":\"" + escapeJson(savedPath) + "\""
+                            + ",\"outcome\":\"" + escapeJson(box.outcome()) + "\""
+                            + (box.outcome().contains("timeout") ? ",\"timeoutMs\":" + RESULT_TIMEOUT.toMillis() : "")
+                            + "}";
 
                     return Flux.just(
                             AgentEvent.result(json),
-                            // 你 Controller 兼容 result_meta / resultMeta，这里建议固定 result_meta
                             AgentEvent.resultMeta(meta)
                     );
                 });
     }
+
+    private record ResultBox(AgentResult result, String outcome, Throwable error) {}
 
     private Flux<AgentEvent> runTimeoutFallback(AgentContext ctx, List<ToolResult> collected, String resultId, Duration runTimeout) {
         var fallback = ResultFallBackBuilder.build(ctx, collected);
