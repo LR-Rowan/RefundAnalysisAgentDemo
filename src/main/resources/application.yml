@@ -15,6 +15,21 @@ agent:
     llmMaxSeconds: 60     # LLM 最长总时长, 防无限输出
     runSeconds: 180       # 整条链路兜底
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    distribution:
+      percentiles-histogram:
+        agent.run.latency: true
+      percentiles:
+        agent.run.latency: 0.5,0.9,0.95,0.99
+
 logging:
   level:
     reactor.netty.channel.FluxReceive: ERROR

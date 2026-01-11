@@ -7,6 +7,7 @@ import com.agent.demo.agent.result.ResultStore;
 import com.agent.demo.config.AgentTimeoutProperties;
 import com.agent.demo.dto.RunRequest;
 import com.agent.demo.infra.ConcurrencyLimiter;
+import com.agent.demo.metrics.AgentMetrics;
 import com.agent.demo.trace.TraceKeys;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -66,6 +67,9 @@ public class AgentController {
     @Autowired
     private AgentTimeoutProperties timeoutProps;
 
+    @Autowired
+    private AgentMetrics metrics;
+
     /**
      * produces = TEXT_EVENT_STREAM: 告诉 Spring 返回的是 SSE
      */
@@ -86,13 +90,17 @@ public class AgentController {
         return Flux.defer(() -> {
             ConcurrencyLimiter.Permit permit = limiter.tryAcquire(ctx.storeId());
             if (!permit.acquired()) {
+                metrics.rateLimited(permit.denyReason());
                 return Flux.error(new ResponseStatusException(
                         HttpStatus.TOO_MANY_REQUESTS,
                         "rate_limited:" + permit.denyReason()
                 ));
             }
 
+            metrics.inflightInc();
+            io.micrometer.core.instrument.Timer.Sample runSample = metrics.runStart();
             final long startMillis = System.currentTimeMillis();
+
             Flux<AgentEvent> source = agentOrchestrator.run(ctx, traceId);
             // 把业务维度写入 Reactor Context，供 MDC/日志/下游使用
             source = source.contextWrite(c ->
@@ -158,9 +166,20 @@ public class AgentController {
 
             // 1) timeout 绑定在最终 out 上，避免外层 timeout 截断导致 permit 不释放
             // 2) doFinally 也绑定在最终 out 上，确保 cancel/timeout/complete 都释放
-            return out
-                    .timeout(timeoutProps.getRun())
-                    .doFinally(sig -> permit.release());
+            return out.timeout(timeoutProps.getRun()).doFinally(sig -> {
+                // outcome 映射
+                String outcome = switch (sig) {
+                    case ON_COMPLETE -> "success";
+                    case CANCEL -> "cancel";
+                    case ON_ERROR -> "error";
+                    default -> "unknown";
+                };
+                // timeout 属于 ON_ERROR，但我们想区分：timeoutProps.getRun() 触发
+                // 这里最小侵入：如果是 timeout，sig 仍是 ON_ERROR，交给 ExceptionHandler/Orchestrator 计数更准
+                metrics.runEnd(runSample, outcome);
+                metrics.inflightDec();
+                permit.release();
+            });
         });
     }
 
