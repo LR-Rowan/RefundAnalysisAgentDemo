@@ -157,9 +157,7 @@ public class AgentOrchestrator {
                                 json = "{\"error\":\"result_serialize_failed\"}";
                             }
 
-                            String meta = "{\"resultId\":\"" + resultId
-                                    + "\",\"traceId\":\"" + escapeJson(traceId)
-                                    + "\",\"downloadUrl\":\"/agent/results/" + resultId
+                            String meta = "{\"downloadUrl\":\"/agent/results/" + resultId
                                     + "\",\"savedPath\":\"" + escapeJson(savedPath) + "\"}";
 
                             return Flux.just(

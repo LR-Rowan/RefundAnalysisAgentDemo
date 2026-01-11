@@ -66,7 +66,8 @@ public class AgentController {
             @RequestHeader(value = "X-Trace-Id", required = false) String traceId,
             @RequestParam(value = "legacy", required = false, defaultValue = "false") boolean legacy,
             @Valid @RequestBody RunRequest request) {
-        AgentContext ctx = new AgentContext(request.storeId(), request.query(), 7);
+        int windowDays = Objects.isNull(request.windowDays()) ? WINDOW_DAYS : request.windowDays();
+        AgentContext ctx = new AgentContext(request.storeId(), request.query(), windowDays);
 
         // 用 defer 确保 startMillis 每次订阅（每次请求）独立，不串
         return Flux.defer(() -> {

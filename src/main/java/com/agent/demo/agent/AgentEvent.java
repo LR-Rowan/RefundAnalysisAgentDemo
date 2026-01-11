@@ -29,7 +29,7 @@ public record AgentEvent(
     }
 
     public static AgentEvent resultMeta(String s) {
-        return new AgentEvent("resultMeta", s);
+        return new AgentEvent("result_meta", s);
     }
 
     // ====== Orchestrator 用来统一打 stamp ======
