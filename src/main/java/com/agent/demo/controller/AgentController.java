@@ -4,6 +4,7 @@ import com.agent.demo.agent.AgentContext;
 import com.agent.demo.agent.AgentEvent;
 import com.agent.demo.agent.AgentOrchestrator;
 import com.agent.demo.agent.result.ResultStore;
+import com.agent.demo.config.AgentTimeoutProperties;
 import com.agent.demo.dto.RunRequest;
 import com.agent.demo.infra.ConcurrencyLimiter;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -61,6 +62,9 @@ public class AgentController {
 
     @Autowired
     private ConcurrencyLimiter limiter;
+
+    @Autowired
+    private AgentTimeoutProperties timeoutProps;
 
     /**
      * produces = TEXT_EVENT_STREAM: 告诉Spring返回的是SSE, 浏览器会一条条接收, 避免Flux一次性聚合
@@ -145,7 +149,7 @@ public class AgentController {
             }
 
             return out.doFinally(sig -> permit.release());
-        });
+        }).timeout(timeoutProps.getRun());
     }
 
 

@@ -1,4 +1,4 @@
-package com.agent.demo.infra;
+package com.agent.demo.config;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 

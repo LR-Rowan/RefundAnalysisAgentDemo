@@ -13,3 +13,9 @@ agent:
     perStoreMaxConcurrent: 2
     storeIdleTtlMinutes: 30
     maxStores: 10000
+  timeouts:
+
+    toolSeconds: 10       # 单个 tool 最长
+    llmIdleSeconds: 15    # LLM 15s 没新 token 判定卡死
+    llmMaxSeconds: 60     # LLM 最长总时长, 防无限输出
+    runSeconds: 180       # 整条链路兜底
