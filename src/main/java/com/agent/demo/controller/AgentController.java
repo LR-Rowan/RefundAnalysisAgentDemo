@@ -175,7 +175,7 @@ public class AgentController {
         String payload = evt.payload() == null ? "" : evt.payload();
 
         // 1) 直接用 event type 判断
-        if ("result".equals(type) || "resultMeta".equals(type)) return "result";
+        if ("result".equals(type) || "result_meta".equals(type)) return "result";
         if ("delta".equals(type)) return "summarizer";
         if ("tool".equals(type)) return "tool";
 
@@ -189,6 +189,7 @@ public class AgentController {
             if (p.startsWith("result_generating")) return "result";
             if (p.startsWith("llm_error")) return "summarizer";
             if (p.startsWith("done")) return "done";
+            if (p.startsWith("run_timeout")) return "error";
             // 如果 status 是 JSON（比如你未来改成 {"stage":"..."}），优先读 stage 字段
             if (payloadObj instanceof JsonNode node) {
                 JsonNode stage = node.get("stage");

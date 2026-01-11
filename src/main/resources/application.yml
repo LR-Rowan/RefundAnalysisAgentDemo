@@ -2,3 +2,7 @@ openai:
   base-url: https://api.302.ai
   api-key: ${OPENAI_API_KEY}
   model: gpt-5-mini
+
+logging:
+  level:
+    reactor.netty.channel.FluxReceive: ERROR

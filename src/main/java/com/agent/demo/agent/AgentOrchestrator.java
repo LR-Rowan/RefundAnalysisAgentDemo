@@ -22,14 +22,17 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Agent - 编排器
  */
 @Service
 public class AgentOrchestrator {
-
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final Duration TOOL_TIMEOUT = Duration.ofSeconds(5);
+    private static final Duration LLM_TIMEOUT  = Duration.ofSeconds(30);
+    private static final Duration RUN_TIMEOUT  = Duration.ofSeconds(90);
 
     private final Planner planner;
     private final ToolRegistry toolRegistry;
@@ -52,7 +55,6 @@ public class AgentOrchestrator {
                 ? incomingTraceId : IdGenerators.newTraceId();
 
         Flux<AgentEvent> start = Flux.just(AgentEvent.status("planning"));
-
         Mono<Plan> planMono = planner.plan(ctx)
                 .onErrorResume(ex -> {
                     // fallback：planner 解析失败时用默认工具集
@@ -89,9 +91,14 @@ public class AgentOrchestrator {
                             return Flux.concat(
                                     Flux.just(AgentEvent.status("tool_running:" + toolName)),
                                     toolRegistry.get(toolName).execute(toolCtx)
+                                            .timeout(TOOL_TIMEOUT)      // 每个 tool 执行加 timeout，超时转为可观测事件
                                             .doOnNext(collected::add)
                                             .map(this::toToolEvent)
                                             .flux()
+                                            .onErrorResume(TimeoutException.class, e -> Flux.just(
+                                                    AgentEvent.status("tool_timeout:" + toolName),
+                                                    AgentEvent.tool("{\"tool\":\"" + toolName + "\",\"error\":\"timeout\",\"timeoutMs\":" + TOOL_TIMEOUT.toMillis() + "}")
+                                            ))
                                             .onErrorResume(ex -> Flux.just(
                                                     AgentEvent.status("tool_error:" + toolName),
                                                     AgentEvent.tool("{\"tool\":\"" + toolName + "\",\"error\":\"" + escapeJson(ex.getMessage()) + "\"}")
@@ -99,13 +106,12 @@ public class AgentOrchestrator {
                             );
                         })
         );
-
         Flux<AgentEvent> summarizingStart = Flux.just(AgentEvent.status("summarizing"));
-
         Flux<AgentEvent> summarizingFlow =
                 Mono.fromCallable(() -> buildSummaryPrompt(ctx, collected))
                         .flatMapMany(prompt ->
                                 openAIClient.stream(prompt)
+                                        .timeout(LLM_TIMEOUT)       // summarizer 流 30s 无数据/不结束 -> 超时并继续后续
                                         .flatMap(line -> {
                                             // 解析 error
                                             var err = OpenAISseParser.extractError(line);
@@ -120,9 +126,13 @@ public class AgentOrchestrator {
                                                     .map(AgentEvent::delta)
                                                     .flux();
                                         })
+                                        .onErrorResume(TimeoutException.class, ex -> Flux.just(
+                                                AgentEvent.status("llm_timeout"),
+                                                AgentEvent.result("{\"error\":\"llm_timeout\",\"timeoutMs\":" + LLM_TIMEOUT.toMillis() + "}")
+                                        ))
                         )
                         // 合并碎片化 delta：每 50ms 或累计 200 个事件合并一次
-                        .bufferTimeout(200, java.time.Duration.ofMillis(50))
+                        .bufferTimeout(200, Duration.ofMillis(50))
                         .flatMap(list -> {
                             if (list.isEmpty()) return Flux.empty();
 
@@ -135,9 +145,7 @@ public class AgentOrchestrator {
                             for (AgentEvent e : list) sb.append(e.payload());
                             return Flux.just(AgentEvent.delta(sb.toString()));
                         });
-
         Flux<AgentEvent> resultStart = Flux.just(AgentEvent.status("result_generating"));
-
         Flux<AgentEvent> resultFlow =
                 resultGenerator.generate(ctx, collected)
                         .timeout(Duration.ofSeconds(60))
@@ -167,17 +175,38 @@ public class AgentOrchestrator {
                         });
 
         Flux<AgentEvent> end = Flux.just(AgentEvent.status("done"));
+        Flux<AgentEvent> mainFlow = Flux.concat(start, planEvent, toolsFlow, summarizingStart, summarizingFlow, resultStart, resultFlow, end);
+        Flux<AgentEvent> withTimeout = mainFlow
+                .timeout(RUN_TIMEOUT)       // 90s 全链路超时 → 统一兜底并保证落盘可下载
+                .onErrorResume(TimeoutException.class, ex -> {
+                    // 统一兜底：保证可下载
+                    var fallback = ResultFallBackBuilder.build(ctx, collected);
+                    String savedPath = resultStore.save(resultId, fallback);
+                    String json;
+                    try {
+                        json = MAPPER.writeValueAsString(fallback);
+                    } catch (Exception e) {
+                        json = "{\"error\":\"fallback_serialize_failed\"}";
+                    }
+                    String meta = "{\"downloadUrl\":\"/agent/results/" + resultId
+                            + "\",\"savedPath\":\"" + escapeJson(savedPath)
+                            + "\",\"timeoutMs\":" + RUN_TIMEOUT.toMillis()
+                            + "}";
 
-        return Flux.concat(start, planEvent, toolsFlow, summarizingStart, summarizingFlow, resultStart, resultFlow, end)
-                // cancel 观测点 + 确保取消信号能触发
+                    return Flux.just(
+                            AgentEvent.status("run_timeout"),
+                            AgentEvent.result(json),
+                            AgentEvent.resultMeta(meta),
+                            AgentEvent.status("done")
+                    );
+                });
+
+        return withTimeout
                 .doOnCancel(() -> System.out.println("[CANCEL] client disconnected"))
-                .doFinally(signal -> System.out.println("[FINALLY] signal=" + signal))
-                // 统一 stamp：保证每个 AgentEvent 都带 rid/tid（包括 fallback/timeout/工具异常产生的事件）
-                //
-                // stampTrace 在下游会读不到 contextWrite 写入的 key，产生报错: "Missing reactor context key: resultId"
+                .doFinally(sig -> System.out.println("[FINALLY] signal=" + sig))
                 .transform(this::stampTrace)
-                // 全链路挂上 traceId/resultId（Planner/Tools/Summarizer/Result/End 全覆盖）
                 .contextWrite(c -> c.put(TraceKeys.RESULT_ID, resultId).put(TraceKeys.TRACE_ID, traceId));
+
     }
 
     private AgentEvent toToolEvent(ToolResult r) {
