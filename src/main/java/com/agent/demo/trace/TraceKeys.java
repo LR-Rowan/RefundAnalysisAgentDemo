@@ -11,5 +11,15 @@ public final class TraceKeys {
      */
     public static final String RESULT_ID = "resultId";
 
+    /**
+     *
+     */
+    public static final String STORE_ID = "storeId";
+
+    /**
+     *
+     */
+    public static final String WINDOW_DAYS = "windowDays";
+
     private TraceKeys() {}
 }

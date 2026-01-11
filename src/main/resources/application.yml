@@ -3,10 +3,6 @@ openai:
   api-key: ${OPENAI_API_KEY}
   model: gpt-5-mini
 
-logging:
-  level:
-    reactor.netty.channel.FluxReceive: ERROR
-
 agent:
   limits:
     globalMaxConcurrent: 10
@@ -14,8 +10,13 @@ agent:
     storeIdleTtlMinutes: 30
     maxStores: 10000
   timeouts:
-
     toolSeconds: 10       # 单个 tool 最长
     llmIdleSeconds: 15    # LLM 15s 没新 token 判定卡死
     llmMaxSeconds: 60     # LLM 最长总时长, 防无限输出
     runSeconds: 180       # 整条链路兜底
+
+logging:
+  level:
+    reactor.netty.channel.FluxReceive: ERROR
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] traceId=%X{traceId} resultId=%X{resultId} storeId=%X{storeId} windowDays=%X{windowDays} %logger{36} - %msg%n"
