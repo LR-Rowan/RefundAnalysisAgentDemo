@@ -69,21 +69,21 @@ public class AgentOrchestrator {
         final String traceId = (incomingTraceId != null && !incomingTraceId.isBlank())
                 ? incomingTraceId
                 : IdGenerators.newTraceId();
+        LOGGER.info("run_start storeId={} windowDays={} query={}", ctx.storeId(), ctx.windowDays(), safeOneLine(ctx.query()));
 
         // run timer
         final var runSample = metrics.runStart();
-
         // tool 汇总结果：顺序执行当前没并发，但这里做成线程安全，避免未来改并发踩坑
         final List<ToolResult> collected = Collections.synchronizedList(new ArrayList<>());
 
         // 1) planner（cache：保证只执行一次）
         Mono<Plan> planMono = planner.plan(ctx)
-                .onErrorResume(ex -> {
-                    LOGGER.warn("planner_failed, fallback default plan. err={}", ex.toString());
-                    return Mono.just(defaultPlan(ctx));
-                })
+                .doOnSubscribe(s -> LOGGER.info("planner_start"))
+                .doOnNext(p -> LOGGER.info("planner_selected tools={}", p.tools() == null ? "[]" :
+                        p.tools().stream().map(ToolCall::name).toList()))
+                .doOnError(e -> LOGGER.warn("planner_error err={}", e.toString()))
+                .onErrorResume(ex -> Mono.just(defaultPlan(ctx)))
                 .cache();
-
         Flux<AgentEvent> start = Flux.just(AgentEvent.status("planning"));
         Flux<AgentEvent> planEvent = planMono.map(this::toPlanEvent).flux();
 
@@ -147,7 +147,6 @@ public class AgentOrchestrator {
     }
 
     // ------------------------- planner -------------------------
-
     private Plan defaultPlan(AgentContext ctx) {
         return new Plan(List.of(
                 new ToolCall("refund_rate", Map.of("windowDays", ctx.windowDays(), "storeId", ctx.storeId())),
@@ -165,13 +164,13 @@ public class AgentOrchestrator {
     }
 
     // ------------------------- tools -------------------------
-
     private Flux<AgentEvent> runOneTool(AgentContext ctx, ToolCall call, List<ToolResult> collected) {
         final String toolName = call.name();
         final int windowDays = parseInt(call.args().get("windowDays"), ctx.windowDays());
         final AgentContext toolCtx = new AgentContext(ctx.storeId(), ctx.query(), windowDays);
 
-        final var toolSample = metrics.toolStart(); // ✅ 无参，修复你现在的编译错误
+        final var toolSample = metrics.toolStart();
+        LOGGER.info("tool_running tool={} windowDays={}", toolName, toolCtx.windowDays());
 
         return Flux.concat(
                 Flux.just(AgentEvent.status("tool_running:" + toolName)),
@@ -180,10 +179,15 @@ public class AgentOrchestrator {
                         .doOnNext(collected::add)
                         .map(this::toToolEvent)
                         .flux()
-                        .doOnComplete(() -> metrics.toolEnd(toolSample, toolName, "ok"))
+                        .doOnComplete(() -> {
+                            metrics.toolEnd(toolSample, toolName, "ok");
+                            LOGGER.info("tool_done tool={} outcome=ok", toolName);
+                        })
                         .onErrorResume(TimeoutException.class, ex -> {
                             metrics.timeout("tool");
                             metrics.toolEnd(toolSample, toolName, "timeout");
+                            LOGGER.warn("tool_done tool={} outcome=timeout timeoutMs={}", toolName, timeoutProps.getTool().toMillis());
+
                             return Flux.just(
                                     AgentEvent.status("tool_timeout:" + toolName),
                                     AgentEvent.tool(toolTimeoutJson(toolName, timeoutProps.getTool()))
@@ -191,6 +195,8 @@ public class AgentOrchestrator {
                         })
                         .onErrorResume(ex -> {
                             metrics.toolEnd(toolSample, toolName, "error");
+                            LOGGER.warn("tool_done tool={} outcome=error err={}", toolName, ex.toString());
+
                             return Flux.just(
                                     AgentEvent.status("tool_error:" + toolName),
                                     AgentEvent.tool("{\"tool\":\"" + toolName + "\",\"error\":\"" + escapeJson(ex.getMessage()) + "\"}")
@@ -220,9 +226,9 @@ public class AgentOrchestrator {
     }
 
     // ------------------------- summarizer (LLM) -------------------------
-
     private Flux<AgentEvent> buildSummarizing(AgentContext ctx, List<ToolResult> collected) {
         final var llmSample = metrics.llmStart();
+        LOGGER.info("llm_start");
 
         Flux<AgentEvent> base =
                 Mono.fromCallable(() -> buildSummaryPrompt(ctx, collected))
@@ -261,6 +267,8 @@ public class AgentOrchestrator {
                         .onErrorResume(TimeoutException.class, ex -> {
                             metrics.timeout("llm_idle");
                             metrics.llmEnd(llmSample, "idle_timeout");
+                            LOGGER.warn("llm_end outcome=idle_timeout timeoutMs={}", timeoutProps.getLlmIdle().toMillis());
+
                             return Flux.just(AgentEvent.status(llmTimeoutJson("llm_idle_timeout", timeoutProps.getLlmIdle())));
                         });
 
@@ -271,13 +279,14 @@ public class AgentOrchestrator {
                                 .flatMapMany(x -> Flux.error(new TimeoutException("llm_max_timeout")))
                 )
                 .doOnComplete(() -> {
-                    // 注意：如果走到了 idle_timeout/max_timeout 分支，这里不会代表 ok
-                    // 这里保守：只有 base 正常完成才算 ok，在 onErrorResume 分支已经结束计时
                     metrics.llmEnd(llmSample, "ok");
+                    LOGGER.info("llm_end outcome=ok");
                 })
                 .onErrorResume(TimeoutException.class, ex -> {
                     metrics.timeout("llm_max");
                     metrics.llmEnd(llmSample, "max_timeout");
+                    LOGGER.warn("llm_end outcome=max_timeout timeoutMs={}", timeoutProps.getLlmMax().toMillis());
+
                     return Flux.just(AgentEvent.status(llmTimeoutJson("llm_max_timeout", timeoutProps.getLlmMax())));
                 })
                 .onErrorResume(ex -> {
@@ -299,7 +308,6 @@ public class AgentOrchestrator {
     }
 
     // ------------------------- result -------------------------
-
     private Flux<AgentEvent> buildResultFlow(AgentContext ctx, List<ToolResult> collected, String resultId) {
         // result generator 的 timeout 也打点（可选）
         return resultGenerator.generate(ctx, collected)
@@ -311,6 +319,7 @@ public class AgentOrchestrator {
                 .onErrorResume(ex -> Mono.just(ResultFallBackBuilder.build(ctx, collected)))
                 .flatMapMany(r -> {
                     String savedPath = resultStore.save(resultId, r);
+                    LOGGER.info("result_saved path={} downloadUrl=/agent/results/{}", savedPath, resultId);
 
                     String json;
                     try {
@@ -354,7 +363,6 @@ public class AgentOrchestrator {
     }
 
     // ------------------------- misc -------------------------
-
     private String buildSummaryPrompt(AgentContext ctx, List<ToolResult> results) throws Exception {
         String toolsJson = MAPPER.writeValueAsString(results);
 
@@ -405,5 +413,10 @@ public class AgentOrchestrator {
             throw new IllegalStateException("Missing reactor context key: " + key);
         }
         return String.valueOf(v);
+    }
+
+    private static String safeOneLine(String s) {
+        if (s == null) return "";
+        return s.replace("\r", " ").replace("\n", " ").trim();
     }
 }
