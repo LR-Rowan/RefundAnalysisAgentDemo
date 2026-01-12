@@ -1,21 +1,78 @@
-This project demonstrates a production-style WebFlux SSE backend that streams LLM outputs in real time, including error handling, proxy-aware OpenAI integration, and reactive flow orchestration — serving as the foundation for AI Agent services.
-该项目展示了一个生产级的 WebFlux SSE 后端，可实时传输 LLM 输出，包括错误处理、代理感知的 OpenAI 集成和响应式流程编排 —— 作为 AI Agent 服务的基础
+🚀 Refund Analysis Agent Demo
+Spring WebFlux + SSE – Production-grade AI Agent Demo
 
-### 验收测试命令
-Invoke-RestMethod "http://localhost:8080/actuator/metrics/agent_inflight"
+📌 项目简介 | Project Overview
+中文：
+这是一个基于 Spring WebFlux + Server-Sent Events (SSE) 的工程化 AI Agent Demo，
+重点展示 长连接场景下的稳定性、可观测性、限流与超时控制，而不仅是模型调用本身。
+项目以「电商退款分析」为示例业务，完整覆盖从 Agent 编排 → Tool 调用 → LLM Streaming → 结果落盘 的全链路。
 
-Invoke-RestMethod "http://localhost:8080/actuator/metrics/agent_run_total"
-Invoke-RestMethod "http://localhost:8080/actuator/metrics/agent_run_latency"
+English:
+This project is a production-oriented AI Agent demo built with Spring WebFlux and Server-Sent Events (SSE).
+It focuses on engineering concerns such as long-lived connections, observability, rate limiting, and timeouts — not just LLM integration.
+The demo uses an e-commerce refund analysis scenario to demonstrate a full Agent pipeline:
+planning → tool execution → LLM streaming → result persistence.
 
-Invoke-RestMethod "http://localhost:8080/actuator/metrics/agent_rate_limited_total"
+🧩 核心能力 | Key Features
+🔁 SSE & Streaming
+· Unified SSE event protocol: status / tool / delta / result / result_meta / done
+· Consistent event envelope with:
+        resultId, traceId
+        seq, ts, durationMs
+        stage, data
+· Legacy mode supported (raw SSE without envelope)
 
-Invoke-RestMethod "http://localhost:8080/actuator/metrics/agent_tool_total"
-Invoke-RestMethod "http://localhost:8080/actuator/metrics/agent_tool_latency"
+❤️ 心跳与生命周期 | Heartbeat & Lifecycle
+· Heartbeat comments (:ping) to prevent idle disconnects
+· Heartbeat lifecycle bound to business stream
+· SSE connection closes naturally after done
+· Prevents heartbeat from masking run-level timeouts
 
-Invoke-RestMethod "http://localhost:8080/actuator/metrics/agent_llm_total"
-Invoke-RestMethod "http://localhost:8080/actuator/metrics/agent_llm_stream_duration"
+🚦 并发限流 | Concurrency Control
+· Global and per-store concurrency limits 
+· Permit-based acquisition & release 
+· agent_inflight metric verified to return to zero after completion / cancel
 
-### 验收标准：
-latency 类指标 MAX > 0
-total 类指标 COUNT >= 1
-inflight 在 run 完成后 VALUE == 0
+⏱ 超时策略 | Timeout Strategy
+· Tool-level timeout
+· LLM idle timeout
+· LLM max execution timeout
+· Run-level global timeout with fallback result persistence
+
+📊 可观测性 | Observability
+· Structured logging with traceId / resultId
+· Micrometer metrics:
+        inflight gauge
+        latency & count per stage
+        rate-limited and timeout counters
+· Actuator endpoints:
+        health / liveness / readiness
+        prometheus (secured)
+
+🗄 结果兜底 | Result Persistence
+· Results always persisted locally (JSON)
+· Downloadable even on timeout or partial failure
+· Clear separation between streaming output and final stored result
+
+🔍 验收方式 | Validation
+中文：
+· 使用 curl -N 验证 SSE 流式输出
+· 通过 Ctrl+C 验证 cancel 行为与资源释放
+· 使用 Prometheus 指标验证 agent_inflight = 0
+· 验证 timeout 场景下结果仍可下载
+
+English:
+· SSE streaming verified via curl -N
+· Client cancellation tested with Ctrl+C
+· Resource cleanup validated via Prometheus (agent_inflight = 0)
+· Result persistence confirmed under timeout scenarios
+
+🎯 适用场景 | Use Cases
+· Backend / Platform engineering interviews
+· SSE & WebFlux production reference
+· AI Agent orchestration demos
+· Observability and resilience examples
+
+🏁 当前状态 | Current Status
+封版版本 / Release Tag: v1.0.0-demo-ready
+This version has passed functional and lifecycle validation and is ready for demo and interview usage.
