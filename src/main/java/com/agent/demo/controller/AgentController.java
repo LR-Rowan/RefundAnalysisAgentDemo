@@ -13,6 +13,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -23,7 +24,11 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
+import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * SSE Controller
@@ -33,17 +38,16 @@ import java.util.Objects;
 @RestController
 @RequestMapping("/agent")
 public class AgentController {
-
     private static final int WINDOW_DAYS = 7;
     private static final ObjectMapper mapper = new ObjectMapper();
 
     /**
      * SSE 可观测增强：
-     * - seq: 单次请求内事件递增序号（从 0 开始）
+     * - seq: 单次请求内事件递增序号（从 0 开始）（仅业务事件；心跳 comment 不计入）
      * - ts: 服务器发送时间（epoch millis）
      * - durationMs: 从本次 run 开始到当前事件的耗时
      * - stage: 粗粒度阶段（planner/tool/summarizer/result/done/error/unknown）
-     * - data: payload（自动识别 JSON -> JsonNode，否则 String）
+     * - data: payload（自动识别 JSON -> JsonNode，否则 String / Map）
      */
     private record SseEnvelope(
             String resultId,
@@ -53,6 +57,15 @@ public class AgentController {
             long durationMs,
             String stage,
             Object data
+    ) {}
+
+    /**
+     * 统一错误负载（HTTP/SSE 都可复用；这里先放 Controller 内避免工程里重复类名）
+     */
+    private record AgentErrorPayload(
+            String code,
+            String message,
+            String stage
     ) {}
 
     @Autowired
@@ -70,13 +83,16 @@ public class AgentController {
     @Autowired
     private AgentMetrics metrics;
 
+    @Value("${agent.sse.heartbeatSeconds:10}")
+    private long heartbeatSeconds;
+
+    @Value("${agent.sse.heartbeatComment:ping}")
+    private String heartbeatComment;
+
     /**
      * produces = TEXT_EVENT_STREAM: 告诉 Spring 返回的是 SSE
      */
-    @PostMapping(
-            value = "/run",
-            produces = MediaType.TEXT_EVENT_STREAM_VALUE
-    )
+    @PostMapping(value = "/run", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public Flux<ServerSentEvent<String>> run(
             @RequestHeader(value = "X-Trace-Id", required = false) String traceId,
             @RequestParam(value = "legacy", required = false, defaultValue = "false") boolean legacy,
@@ -86,7 +102,6 @@ public class AgentController {
         int windowDays = Objects.isNull(request.windowDays()) ? WINDOW_DAYS : request.windowDays();
         AgentContext ctx = new AgentContext(request.storeId(), request.query(), windowDays);
 
-        // defer: 确保只有真正订阅时才占用 permit
         return Flux.defer(() -> {
             ConcurrencyLimiter.Permit permit = limiter.tryAcquire(ctx.storeId());
             if (!permit.acquired()) {
@@ -100,24 +115,19 @@ public class AgentController {
             metrics.inflightInc();
             io.micrometer.core.instrument.Timer.Sample runSample = metrics.runStart();
             final long startMillis = System.currentTimeMillis();
+            Flux<AgentEvent> source = agentOrchestrator.run(ctx, traceId)
+                    .contextWrite(c -> c.put(TraceKeys.STORE_ID, ctx.storeId()).put(TraceKeys.WINDOW_DAYS, windowDays));
 
-            Flux<AgentEvent> source = agentOrchestrator.run(ctx, traceId);
-            // 把业务维度写入 Reactor Context，供 MDC/日志/下游使用
-            source = source.contextWrite(c ->
-                    c.put(TraceKeys.STORE_ID, ctx.storeId()).put(TraceKeys.WINDOW_DAYS, windowDays)
-            );
-
-            Flux<ServerSentEvent<String>> out;
+            // -------- 1) 只构建“业务 SSE 流”（不含 heartbeat） --------
+            Flux<ServerSentEvent<String>> business;
             if (legacy) {
-                // 旧协议：完全不包 envelope
-                out = source.map(evt -> ServerSentEvent.<String>builder()
+                business = source.map(evt -> ServerSentEvent.<String>builder()
                         .event(evt.type())
                         .data(evt.payload())
                         .build());
             } else {
-                // 新协议：带观测字段 + envelope
-                out = source
-                        .index() // 给每个事件一个 seq（0..n）
+                business = source
+                        .index()
                         .map(tuple -> {
                             long seq = tuple.getT1();
                             AgentEvent evt = tuple.getT2();
@@ -141,7 +151,6 @@ public class AgentController {
                             try {
                                 data = mapper.writeValueAsString(env);
                             } catch (Exception e) {
-                                // 生产级容错：序列化失败不能打断 SSE stream
                                 data = "{\"resultId\":\"" + safe(evt.resultId()) +
                                         "\",\"traceId\":\"" + safe(evt.traceId()) +
                                         "\",\"seq\":" + seq +
@@ -152,30 +161,42 @@ public class AgentController {
                             }
 
                             return ServerSentEvent.<String>builder()
-                                    .event(evt.type()) // event 名仍然保持：status/tool/delta/result/result_meta...
+                                    .event(evt.type())
                                     .data(data)
                                     .build();
                         });
             }
 
             // Debug hold：用于压测/验收并发隔离，让连接占用更稳定（非阻塞）
-            // debugHoldMs=0 默认不生效
             if (debugHoldMs > 0) {
-                out = out.concatWith(Mono.delay(Duration.ofMillis(debugHoldMs)).flatMapMany(x -> Flux.empty()));
+                business = business.concatWith(Mono.delay(Duration.ofMillis(debugHoldMs)).flatMapMany(x -> Flux.empty()));
             }
 
-            // 1) timeout 绑定在最终 out 上，避免外层 timeout 截断导致 permit 不释放
-            // 2) doFinally 也绑定在最终 out 上，确保 cancel/timeout/complete 都释放
-            return out.timeout(timeoutProps.getRun()).doFinally(sig -> {
-                // outcome 映射
+            // -------- 2) run timeout 只作用在业务流（避免 heartbeat 刷新 timeout） --------
+            Flux<ServerSentEvent<String>> guardedBusiness = business
+                    .timeout(timeoutProps.getRun())
+                    .doOnCancel(() -> {
+                        // 业务侧断连（更靠近真实 cancel）
+                        // 你也可以这里加一条日志：log.warn("sse_client_disconnected");
+                    });
+
+            // -------- 3) heartbeat 只在业务流存活期间发送，业务结束后 heartbeat 自动停止 --------
+            // 心跳间隔建议 10s（可配置），这里写死示例；你可以替换成配置项
+            Flux<ServerSentEvent<String>> heartbeat = Flux.interval(Duration.ofSeconds(10))
+                    .map(t -> ServerSentEvent.<String>builder().comment("ping").build())
+                    .takeUntilOther(guardedBusiness.ignoreElements());
+
+            // 合并后：业务结束 => heartbeat 也结束 => SSE 连接自然 close
+            Flux<ServerSentEvent<String>> out = Flux.merge(heartbeat, guardedBusiness);
+
+            // doFinally 绑在最终 out 上，确保 complete/cancel/error 都释放资源
+            return out.doFinally(sig -> {
                 String outcome = switch (sig) {
                     case ON_COMPLETE -> "success";
                     case CANCEL -> "cancel";
                     case ON_ERROR -> "error";
                     default -> "unknown";
                 };
-                // timeout 属于 ON_ERROR，但我们想区分：timeoutProps.getRun() 触发
-                // 这里最小侵入：如果是 timeout，sig 仍是 ON_ERROR，交给 ExceptionHandler/Orchestrator 计数更准
                 metrics.runEnd(runSample, outcome);
                 metrics.inflightDec();
                 permit.release();
@@ -198,6 +219,60 @@ public class AgentController {
                                 .contentType(MediaType.APPLICATION_JSON)
                                 .body("{\"error\":\"not_found\",\"message\":\"" + ex.getMessage().replace("\"", "\\\"") + "\"}")
                 ));
+    }
+
+    private ServerSentEvent<String> buildEnvelopeEvent(
+            String event,
+            String resultId,
+            String traceId,
+            long seq,
+            long startMillis,
+            String stage,
+            Object dataObj) {
+        long ts = System.currentTimeMillis();
+        long durationMs = ts - startMillis;
+
+        SseEnvelope env = new SseEnvelope(
+                resultId,
+                traceId,
+                seq,
+                ts,
+                durationMs,
+                stage,
+                dataObj
+        );
+        String data;
+        try {
+            data = mapper.writeValueAsString(env);
+        } catch (Exception e) {
+            data = "{\"resultId\":\"" + safe(resultId) +
+                    "\",\"traceId\":\"" + safe(traceId) +
+                    "\",\"seq\":" + seq +
+                    ",\"ts\":" + ts +
+                    ",\"durationMs\":" + durationMs +
+                    ",\"stage\":\"error\"" +
+                    ",\"data\":\"json_serialize_failed\"}";
+        }
+
+        return ServerSentEvent.<String>builder()
+                .event(event)
+                .data(data)
+                .build();
+    }
+
+    private static boolean isTimeout(Throwable ex) {
+        if (ex == null) return false;
+        if (ex instanceof TimeoutException) return true;
+        String n = ex.getClass().getName();
+        // reactor 的超时异常类名可能不同版本有差异
+        return n != null && n.toLowerCase().contains("timeout");
+    }
+
+    private static String safeMsg(Throwable ex) {
+        if (ex == null) return "unexpected error";
+        String msg = ex.getMessage();
+        if (msg == null || msg.isBlank()) return ex.getClass().getSimpleName();
+        return msg.length() > 300 ? msg.substring(0, 300) : msg;
     }
 
     /**

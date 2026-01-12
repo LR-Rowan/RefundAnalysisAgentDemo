@@ -26,9 +26,16 @@ import reactor.util.context.ContextView;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Agent - 编排器
+ * <p>
+ * 新增:
+ * (1) CANCEL 场景下 tool/llm metrics 一定闭环（doFinally 兜底）
+ * (2) client 断连（cancel）明确日志
+ * (3) run-level timeout 保持兜底落盘（避免 Controller 合并心跳后 timeout 失效）
  */
 @Service
 public class AgentOrchestrator {
@@ -70,10 +77,10 @@ public class AgentOrchestrator {
         final String traceId = (incomingTraceId != null && !incomingTraceId.isBlank())
                 ? incomingTraceId
                 : IdGenerators.newTraceId();
-        LOGGER.info("run_start storeId={} windowDays={} query={}", ctx.storeId(), ctx.windowDays(), safeOneLine(ctx.query()));
 
-        // run timer
-        final var runSample = metrics.runStart();
+        LOGGER.info("run_start storeId={} windowDays={} query={}",
+                ctx.storeId(), ctx.windowDays(), safeOneLine(ctx.query()));
+
         // tool 汇总结果：顺序执行当前没并发，但这里做成线程安全，避免未来改并发踩坑
         final List<ToolResult> collected = Collections.synchronizedList(new ArrayList<>());
 
@@ -85,6 +92,7 @@ public class AgentOrchestrator {
                 .doOnError(e -> LOGGER.warn("planner_error err={}", e.toString()))
                 .onErrorResume(ex -> Mono.just(defaultPlan(ctx)))
                 .cache();
+
         Flux<AgentEvent> start = Flux.just(AgentEvent.status("planning"));
         Flux<AgentEvent> planEvent = planMono.map(this::toPlanEvent).flux();
 
@@ -124,25 +132,8 @@ public class AgentOrchestrator {
                 });
 
         return withTimeout
-                .doOnCancel(() -> {
-                    // client cancel：通常是浏览器断开 / curl ctrl+c
-                    LOGGER.warn("client_disconnected");
-                    // 这里不 stop runSample；让 doFinally 统一处理
-                })
-                .doFinally(sig -> {
-                    // run outcome
-                    String outcome = switch (sig) {
-                        case ON_COMPLETE -> "success";
-                        case CANCEL -> "cancel";
-                        case ON_ERROR -> "error";
-                        default -> "unknown";
-                    };
-                    // 注意：run_timeout 在上面被兜底成正常完成，sig 可能是 ON_COMPLETE
-                    // 口径修复建议在 Controller 侧更准确（按事件内容判断 timeout）
-                    metrics.runEnd(runSample, outcome);
-
-                    LOGGER.info("run_finally signal={}", sig);
-                })
+                .doOnCancel(() -> LOGGER.warn("client_disconnected"))
+                .doFinally(sig -> LOGGER.info("run_finally signal={}", sig))
                 .transform(this::stampTrace)
                 .contextWrite(c -> c.put(TraceKeys.RESULT_ID, resultId).put(TraceKeys.TRACE_ID, traceId));
     }
@@ -169,40 +160,56 @@ public class AgentOrchestrator {
         final String toolName = call.name();
         final int windowDays = parseInt(call.args().get("windowDays"), ctx.windowDays());
         final AgentContext toolCtx = new AgentContext(ctx.storeId(), ctx.query(), windowDays);
-
         final var toolSample = metrics.toolStart();
+        final AtomicReference<String> outcome = new AtomicReference<>("unknown");
+        final AtomicBoolean ended = new AtomicBoolean(false);
         LOGGER.info("tool_running tool={} windowDays={}", toolName, toolCtx.windowDays());
+
+        Flux<AgentEvent> exec = toolRegistry.get(toolName).execute(toolCtx)
+                .timeout(timeoutProps.getTool())
+                .doOnNext(collected::add)
+                .map(this::toToolEvent)
+                .flux()
+                .doOnComplete(() -> outcome.set("ok"))
+                .onErrorResume(TimeoutException.class, ex -> {
+                    metrics.timeout("tool");
+                    outcome.set("timeout");
+                    LOGGER.warn("tool_done tool={} outcome=timeout timeoutMs={}",
+                            toolName, timeoutProps.getTool().toMillis());
+                    return Flux.just(
+                            AgentEvent.status("tool_timeout:" + toolName),
+                            AgentEvent.tool(toolTimeoutJson(toolName, timeoutProps.getTool()))
+                    );
+                })
+                .onErrorResume(ex -> {
+                    outcome.set("error");
+                    LOGGER.warn("tool_done tool={} outcome=error err={}", toolName, ex.toString());
+                    return Flux.just(
+                            AgentEvent.status("tool_error:" + toolName),
+                            AgentEvent.tool("{\"tool\":\"" + toolName + "\",\"error\":\"" + escapeJson(ex.getMessage()) + "\"}")
+                    );
+                })
+                .doFinally(sig -> {
+                    // CANCEL 场景 metrics 也要闭环
+                    if (ended.compareAndSet(false, true)) {
+                        String out = outcome.get();
+                        if ("unknown".equals(out) && sig == reactor.core.publisher.SignalType.CANCEL) {
+                            out = "cancel";
+                        } else if ("unknown".equals(out) && sig == reactor.core.publisher.SignalType.ON_ERROR) {
+                            out = "error";
+                        } else if ("unknown".equals(out) && sig == reactor.core.publisher.SignalType.ON_COMPLETE) {
+                            out = "ok";
+                        }
+                        metrics.toolEnd(toolSample, toolName, out);
+                        if ("ok".equals(out)) {
+                            LOGGER.info("tool_done tool={} outcome=ok", toolName);
+                        }
+                    }
+                });
 
         return Flux.concat(
                 Flux.just(AgentEvent.status("tool_running:" + toolName)),
-                toolRegistry.get(toolName).execute(toolCtx)
-                        .timeout(timeoutProps.getTool())
-                        .doOnNext(collected::add)
-                        .map(this::toToolEvent)
-                        .flux()
-                        .doOnComplete(() -> {
-                            metrics.toolEnd(toolSample, toolName, "ok");
-                            LOGGER.info("tool_done tool={} outcome=ok", toolName);
-                        })
-                        .onErrorResume(TimeoutException.class, ex -> {
-                            metrics.timeout("tool");
-                            metrics.toolEnd(toolSample, toolName, "timeout");
-                            LOGGER.warn("tool_done tool={} outcome=timeout timeoutMs={}", toolName, timeoutProps.getTool().toMillis());
-
-                            return Flux.just(
-                                    AgentEvent.status("tool_timeout:" + toolName),
-                                    AgentEvent.tool(toolTimeoutJson(toolName, timeoutProps.getTool()))
-                            );
-                        })
-                        .onErrorResume(ex -> {
-                            metrics.toolEnd(toolSample, toolName, "error");
-                            LOGGER.warn("tool_done tool={} outcome=error err={}", toolName, ex.toString());
-
-                            return Flux.just(
-                                    AgentEvent.status("tool_error:" + toolName),
-                                    AgentEvent.tool("{\"tool\":\"" + toolName + "\",\"error\":\"" + escapeJson(ex.getMessage()) + "\"}")
-                            );
-                        })
+                exec
         );
     }
 
@@ -229,6 +236,9 @@ public class AgentOrchestrator {
     // ------------------------- summarizer (LLM) -------------------------
     private Flux<AgentEvent> buildSummarizing(AgentContext ctx, List<ToolResult> collected) {
         final var llmSample = metrics.llmStart();
+        final AtomicReference<String> outcome = new AtomicReference<>("unknown");
+        final AtomicBoolean ended = new AtomicBoolean(false);
+
         LOGGER.info("llm_start");
 
         Flux<AgentEvent> base =
@@ -238,7 +248,7 @@ public class AgentOrchestrator {
                                         .flatMap(line -> {
                                             var err = OpenAISseParser.extractError(line);
                                             if (err.isPresent()) {
-                                                // 这里仍然吐 result（保持你现有行为），但不影响最终结构化 result
+                                                outcome.set("upstream_error");
                                                 return Flux.just(
                                                         AgentEvent.status("llm_error"),
                                                         AgentEvent.result(err.get())
@@ -267,9 +277,9 @@ public class AgentOrchestrator {
                 base.timeout(timeoutProps.getLlmIdle())
                         .onErrorResume(TimeoutException.class, ex -> {
                             metrics.timeout("llm_idle");
-                            metrics.llmEnd(llmSample, "idle_timeout");
-                            LOGGER.warn("llm_end outcome=idle_timeout timeoutMs={}", timeoutProps.getLlmIdle().toMillis());
-
+                            outcome.set("idle_timeout");
+                            LOGGER.warn("llm_end outcome=idle_timeout timeoutMs={}",
+                                    timeoutProps.getLlmIdle().toMillis());
                             return Flux.just(AgentEvent.status(llmTimeoutJson("llm_idle_timeout", timeoutProps.getLlmIdle())));
                         });
 
@@ -279,21 +289,32 @@ public class AgentOrchestrator {
                         Mono.delay(timeoutProps.getLlmMax())
                                 .flatMapMany(x -> Flux.error(new TimeoutException("llm_max_timeout")))
                 )
-                .doOnComplete(() -> {
-                    metrics.llmEnd(llmSample, "ok");
-                    LOGGER.info("llm_end outcome=ok");
-                })
+                .doOnComplete(() -> outcome.compareAndSet("unknown", "ok"))
                 .onErrorResume(TimeoutException.class, ex -> {
                     metrics.timeout("llm_max");
-                    metrics.llmEnd(llmSample, "max_timeout");
+                    outcome.set("max_timeout");
                     LOGGER.warn("llm_end outcome=max_timeout timeoutMs={}", timeoutProps.getLlmMax().toMillis());
-
                     return Flux.just(AgentEvent.status(llmTimeoutJson("llm_max_timeout", timeoutProps.getLlmMax())));
                 })
                 .onErrorResume(ex -> {
-                    // 其他异常（如 downstream cancel 引发的异常等）
-                    metrics.llmEnd(llmSample, "error");
+                    outcome.set("error");
                     return Flux.just(AgentEvent.status("{\"type\":\"llm_error\"}"));
+                })
+                .doFinally(sig -> {
+                    if (ended.compareAndSet(false, true)) {
+                        String out = outcome.get();
+                        if ("unknown".equals(out) && sig == reactor.core.publisher.SignalType.CANCEL) {
+                            out = "cancel";
+                        } else if ("unknown".equals(out) && sig == reactor.core.publisher.SignalType.ON_ERROR) {
+                            out = "error";
+                        } else if ("unknown".equals(out) && sig == reactor.core.publisher.SignalType.ON_COMPLETE) {
+                            out = "ok";
+                        }
+                        metrics.llmEnd(llmSample, out);
+                        if ("ok".equals(out)) {
+                            LOGGER.info("llm_end outcome=ok");
+                        }
+                    }
                 });
     }
 
