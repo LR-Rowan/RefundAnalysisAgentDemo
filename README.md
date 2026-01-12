@@ -74,5 +74,5 @@ English:
 · Observability and resilience examples
 
 🏁 当前状态 | Current Status
-封版版本 / Release Tag: v1.0.0-demo-ready
+封版版本 / Release Tag: v1.0-demo-ready
 This version has passed functional and lifecycle validation and is ready for demo and interview usage.
